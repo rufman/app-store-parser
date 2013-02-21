@@ -3,11 +3,21 @@ Created on Feb 20, 2013
 
 @author: stephane
 '''
-import feedparser
 from pymongo import MongoClient
-import simplejson as json
-import requests
+import logging
+import time
+import threading
 import datetime
+from AppleRssFeedReader.popularity import HourPopularity
+
+logger = logging.getLogger('logger')
+logger.setLevel(logging.INFO)
+hdlr = logging.FileHandler('appdj.log')
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+hdlr.setFormatter(formatter)
+logger.addHandler(hdlr) 
+
+MONGO_CONNECTION_URL = 'mongodb://localhost/appdj'
 
 CATEGORIES = {'Book' : 6018,
               'Business' : 6000,
@@ -65,88 +75,51 @@ COUNTRY_CODES = {'gw': 'Guinea-Bissau', 'gt': 'Guatemala', 'gr': 'Greece', 'gy':
                  'sk': 'Slovakia', 'kr': 'Republic Of Korea', 'si': 'Slovenia', 'kw': 'Kuwait', 'sn': 'Senegal', 
                  'sl': 'Sierra Leone', 'sc': 'Seychelles', 'kz': 'Kazakstan', 'ky': 'Cayman Islands', 'sg': 'Singapore', 'se': 'Sweden'}
 
+LISTS = {'topfreeapplications' : ['free', 'mobile' ], 
+         'toppaidapplications' : ['paid', 'mobile' ], 
+         'topgrossingapplications' : ['gross', 'mobile' ],
+         'topfreeipadapplications' : ['free', 'tablet' ],
+         'toppaidipadapplications' : ['paid', 'tablet' ],
+         'topgrossingipadapplications' : ['gross', 'tablet' ]}
 
-class AppleRssFeed(self):
-    
-    def __init__(self, url, list_name):
-        self.url = url
-        self.list_name = list_name
+class CountryThread(threading.Thread):
+    def __init__(self, country_code, country, db):
+        threading.Thread.__init__(self)
+        self.country_code = country_code
+        self.country = country
+        self.db = db
         
-    def parse_popularity(self):
-        connection = MongoClient('mongodb://appdj:appdjapple@mongodb1.alwaysdata.com/appdj_apple')
-        db = connection.appdj_apple
-        data = feedparser.parse(self.url)
-        apps = db.apps
-        apps_localized = db.apps_localized
-        popularity_lists = db.popularity_lists
-        hourly_lists = db.hourly_lists
-        
-        app_list = []
-        
-        for enrty in data.feed.entries:
-            searchapi_lookup = 'https://itunes.apple.com/lookup?id='+entry.im_id
-            response = requests.get(searchapi_lookup)
-            search_entry = json.load(response).results[0]
-            app = {'_id' : search_entry.trackId,
-                   'bundle_id' : search_entry.bundleId,
-                   'name' : search_entry.trackName,
-                   'categories' : search_entry.genreIds,
-                   'primary_category' : search_entry.primaryGenreId,
-                   'developer' : search_entry.artistName,
-                   'developer_id' : search_entry.artistId,
-                   'icon' : search_entry.artworkUrl60,
-                   'feature_graphic' : search_entry.artworkUrl512,
-                   'rating_currver' : search_entry.averageUserRatingForCurrentVersion,
-                   'num_rating_currver' : search_entry.userRatingCountForCurrentVersion,
-                   'rating' : search_entry.averageUserRating,
-                   'num_rating' : search_entry.userRatingCount,
-                   'maturity' : search_entry.contentAdvisoryRating,
-                   'release_date' : search_entry.releaseDate,
-                   'version' : search_entry.version,
-                   'screenshots' : search_entry.screenshotUrls,
-                   'screenshots_ipad' : search_entry.ipadScreenshotUrls,
-                   'supported_devices' : search_entry.supportedDevices,
-                   }
-            app_id = apps.save(app)
-            app_localized = {'app_id' : search_entry.trackId,
-                             'description' : search_entry.description,
-                             'price' : search_entry.price,
-                             'currency' : search_entry.currency,
-                             'relase_notes' : search_entry.releaseNotes,
-                             }
-            app_loc_id = apps_localized.save(app_localized)
-            app_on_list = {'app_id' : search_entry.trackId,
-                           'name' : search_entry.trackName,
-                           'developer' : search_entry.artistName,
-                           'icon' : search_entry.artworkUrl60,
-                           'feature_graphic' : search_entry.artworkUrl512,
-                           'rating' : search_entry.averageUserRating,
-                           'screenshots' : search_entry.screenshotUrls,
-                           'screenshots_ipad' : search_entry.ipadScreenshotUrls,
-                        }
-            app_list.append(app_on_list)
+    def run(self):
+        country_start = time.time()
+        for list, identifier in LISTS.items():
+            logger.info("Started list: %s for counrty: %s" % (list, self.country))
+            list_start = time.time()
+            all_url = 'https://itunes.apple.com/%s/rss/%s/limit=400/xml' % (self.country_code, list)
+            all_name = 'p_%s_%s_all_h_%s' % (identifier[1], self.country_code, identifier[0])
+            a = HourPopularity(all_url, all_name, self.country_code, self.db) # all categories
+            a.parse_popularity()
+            # for each category
+            for catname, catnr in CATEGORIES.items():
+                cat_start = time.time()
+                url = 'https://itunes.apple.com/%s/rss/topfreeapplications/limit=400/genre=%s/xml' % (self.country_code, catnr)
+                name = 'p_%s_%s_%s_h_%s' % (identifier[1], self.country_code, catnr, identifier[0])
+                a = HourPopularity(url, name, self.country_code, self.db)
+                a.parse_popularity()
+                logger.info("Finished category %s for list %s in country %s: in %s seconds" % (catnr, list, self.country_code, time.time()-cat_start))
             
-        list = {'_id' : self.list_name,
-                'apps' : app_list,
-                }
-        popularity_lists_id = popularity_lists.save(list)
-        hourly_list = {'_id' :  self.list_name+'_'+datetime.datetime.now().hour,
-                       'apps' : app_list,
-                       }
-        hourly_lists_id = hourly_lists.save()
-        
+            logger.info("Finished list %s for %s: in %s seconds" % (list, self.country_code, time.time()-list_start))
+            
+        logger.info("Finished country: %s in %s seconds" % (self.country, time.time()-country_start))
         
 def main():
+    logger.info("Started at: %s" % (datetime.datetime.now()))
+    connection = MongoClient(MONGO_CONNECTION_URL)
+    db = connection.appdj
+    
     # top free mobile
     for code, country in COUNTRY_CODES.items():
-        url = 'https://itunes.apple.com/%s/rss/topfreeapplications/limit=400/xml' % (code, catnr)
-        name = 'p_mobile_%s_all_h_free' % (code)
-        AppRssFeed(url, name) # all categories
-        # for each category
-        for catname, catnr in CATEGORIES.items():
-            url = 'https://itunes.apple.com/%s/rss/topfreeapplications/limit=400/genre=%s/xml' % (code, catnr)
-            name = 'p_mobile_%s_%s_h_free' % (code, catnr)
-            AppRssFeed(url, name)
+        c = CountryThread(code, country, db)
+        c.start()
 
 if __name__ == '__main__':
-    pass
+    main()
